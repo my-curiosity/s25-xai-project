@@ -5,9 +5,17 @@ from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision import transforms
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import torchvision.transforms.functional as F
+import torch.nn.functional as F_nn
+
+
+
 
 
 def calculate_channel_attributions(img):
+    img.requires_grad_()
+
     # Forward pass up to last layer
     x = model.conv1(img)
     x = model.bn1(x)
@@ -34,13 +42,40 @@ def calculate_channel_attributions(img):
     # Sum gradients across spatial dimensions
     attributions = grads.sum(dim=(2, 3)).abs().squeeze()
 
-    return attributions
+    return attributions, last_layer_activations.detach()
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Boris section
+# added visualization method
+def visualize_activation_on_image(image_tensor, activation_map, title=""):
+    # bring image back to PIL-format (reversing normalization of the network such that human can intepret again)
+    img = image_tensor.squeeze(0).cpu()
+    img = F.to_pil_image(img)
+
+    # interpolate the 7x7 activation map to 224x224 to overlay it and normalize it to ensure proper colors in the heatmap
+    act = activation_map.unsqueeze(0).unsqueeze(0)  # (1, 1, 7, 7)
+    act = F_nn.interpolate(act, size=(224, 224), mode="bilinear", align_corners=False).squeeze()
+    act -= act.min()
+    act /= act.max()
+
+    # plot
+    plt.figure(figsize=(6, 6))
+    plt.imshow(img)
+    plt.imshow(act.cpu(), cmap='jet', alpha=0.5)  # heatmap drüber
+    plt.title(title)
+    plt.axis("off")
+    plt.show()
+
+# Boris section
+# --------------------------------------------------------------------------------------------------------------
 
 
 # Import ResNet, set to evaluation mode
 model = resnet50(weights=ResNet50_Weights.DEFAULT)
 model.eval()
-
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
 
 # Load validation split of the ImageNet dataset, apply transforms, init data loader
 transform = transforms.Compose([
@@ -69,16 +104,31 @@ label_counts = [0 for l in range(n_labels)]
 important_channels = [defaultdict(int) for l in range(n_labels)]
 poly = defaultdict(int)
 
+
 # For each image
 for idx, (img, label) in tqdm(enumerate(loader)):
+    img = img.to(device)
     # Increase label count
     label_counts[label] += 1
 
-    if idx >= 10000:
+    if idx >= 300:
          break  # use first 10000 images
 
     # Get attributions
-    img_attributions = calculate_channel_attributions(img)
+    img_attributions, last_activations = calculate_channel_attributions(img)
+
+    # ------------------------------------------------------------------------------------
+    # Boris begin
+    if idx == 0:
+        # Top-3 Kanäle mit höchsten Attribution-Werten
+        top3_indices = torch.topk(img_attributions, 3).indices
+
+        for i, channel_idx in enumerate(top3_indices):
+            activation_map = last_activations[0, channel_idx].detach().cpu()
+            visualize_activation_on_image(img.cpu(), activation_map, title=f"Top-{i+1} Channel {channel_idx.item()}")
+
+    # Boris end
+    # ---------------------------------------------------------------------------------------------
 
     # Find important channels for the image
     # -> Attribution >= 2% of total
