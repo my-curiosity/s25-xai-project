@@ -86,28 +86,23 @@ def visualize_activation_on_image(image_tensor, activation_map, title=""):
 
 
 # Saliency Map for inputxgradient for pixel attributions
-def get_inputxgradient_saliency(img):
-    img.requires_grad = True
-    output = model(img)
-    pred = output.argmax(dim=1)
-    target = output[0, pred]
-
-    grad = torch.autograd.grad(target, img)[0]
-    saliency = (grad * img).sum(dim=1, keepdim=True)
-    return saliency
+# def get_inputxgradient_saliency(img):
+#     img.requires_grad = True
+#     output = model(img)
+#     pred = output.argmax(dim=1)
+#     target = output[0, pred]
+#
+#     grad = torch.autograd.grad(target, img)[0]
+#     saliency = (grad * img).sum(dim=1, keepdim=True)
+#     return saliency
 
 
 
 # Adding InputXGradient
 def inputxgradient_channel_attributions(img):
-    img.requires_grad=True
-    output = model(img)
-    prediction = output.argmax(dim=1)
-    prediction_output = torch.gather(output, 1, prediction.unsqueeze(-1))
+    img.requires_grad_()
 
-    gradients = torch.autograd.grad(prediction_output, img, create_graph=False)[0]
-    input_x_gradients = gradients * img
-
+    # Forward pass up to last conv layer
     x = model.conv1(img)
     x = model.bn1(x)
     x = model.relu(x)
@@ -115,58 +110,61 @@ def inputxgradient_channel_attributions(img):
     x = model.layer1(x)
     x = model.layer2(x)
     x = model.layer3(x)
-    last_layer_activations = model.layer4(x)
+    activations = model.layer4(x)  # shape: (1, 2048, 7, 7)
 
-    # resize
-    input_xg_resized = F_nn.interpolate(input_x_gradients, size=(7, 7), mode="bilinear", align_corners=False)
-    input_xg_reduced = input_xg_resized.mean(dim=1, keepdim=True)
+    # Clone and retain grad for attribution
+    activations = activations.clone().detach().requires_grad_()
 
-    # inputXgradient
-    activations = last_layer_activations * input_xg_reduced
+    # Complete forward
+    pooled = torch.nn.functional.adaptive_avg_pool2d(activations, (1, 1))
+    logits = model.fc(pooled.view(pooled.size(0), -1))
 
-    # Average
-    pooled = torch.nn.AdaptiveAvgPool2d((1, 1))(activations)
-    channel_attributions = pooled.view(pooled.size(0), -1).squeeze()
+    # Target logit
+    target_logit = logits[0, logits.argmax(dim=1)]
 
-    return channel_attributions.abs(), last_layer_activations.detach()
+    # Compute gradients w.r.t. activations
+    grads = torch.autograd.grad(target_logit, activations)[0]
+
+    # Input × Grad at activation level
+    input_x_grad = grads * activations  # shape: (1, 2048, 7, 7)
+    channel_attributions = input_x_grad.sum(dim=(2, 3)).squeeze().abs()
+
+    return channel_attributions, activations.detach()
 
 
 # smoothgrad implmenation with adjustmenets (batch size in forward) to speed up the process
 def smoothgrad_channel_attributions(img):
-    all_gradients = []
-    for i in range(16):
-        img_noisy = img.clone() + 0.15 * torch.randn_like(img)
-        img_noisy = img_noisy.detach()
-        img_noisy.requires_grad = True
+    img = img.detach()
+    noise_std = 0.15
+    all_inputxgrads = []
 
-        output = model(img_noisy)
-        prediction = output.argmax(dim=1)
-        prediction_output = torch.gather(output, 1, prediction.unsqueeze(-1))
+    for _ in range(15):
+        img_noisy = img + noise_std * torch.randn_like(img)
+        img_noisy = img_noisy.detach().requires_grad_()
 
-        gradients = torch.autograd.grad(prediction_output, img_noisy, create_graph=False)[0]  # compute gradient
-        all_gradients.append(gradients.detach())
+        # Forward to activations
+        x = model.conv1(img_noisy)
+        x = model.bn1(x)
+        x = model.relu(x)
+        x = model.maxpool(x)
+        x = model.layer1(x)
+        x = model.layer2(x)
+        x = model.layer3(x)
+        activations = model.layer4(x)
+        activations = activations.clone().detach().requires_grad_()
 
-    gradients = torch.stack(all_gradients, dim=0).mean(dim=0)
-    input_x_gradients = gradients * img
+        pooled = torch.nn.functional.adaptive_avg_pool2d(activations, (1, 1))
+        logits = model.fc(pooled.view(pooled.size(0), -1))
+        target_logit = logits[0, logits.argmax(dim=1)]
 
-    x = model.conv1(img)
-    x = model.bn1(x)
-    x = model.relu(x)
-    x = model.maxpool(x)
-    x = model.layer1(x)
-    x = model.layer2(x)
-    x = model.layer3(x)
-    last_layer_activations = model.layer4(x)
+        grads = torch.autograd.grad(target_logit, activations)[0]
+        inputxgrad = grads * activations
+        all_inputxgrads.append(inputxgrad.detach())
 
-    input_xg_resized = F_nn.interpolate(input_x_gradients, size=(7, 7), mode="bilinear", align_corners=False)
-    input_xg_reduced = input_xg_resized.mean(dim=1, keepdim=True)
+    avg_inputxgrad = torch.stack(all_inputxgrads, dim=0).mean(dim=0)
+    channel_attributions = avg_inputxgrad.sum(dim=(2, 3)).squeeze().abs()
 
-    activations = last_layer_activations * input_xg_reduced
-
-    pooled = torch.nn.AdaptiveAvgPool2d((1, 1))(activations)
-    channel_attributions = pooled.view(pooled.size(0), -1).squeeze()
-
-    return channel_attributions.abs(), last_layer_activations.detach(), gradients
+    return channel_attributions, activations.detach(), avg_inputxgrad.detach()
 
 
 def gradcam_channel_attributions(img):
