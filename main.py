@@ -47,6 +47,59 @@ def calculate_channel_attributions(img):
     return attributions, last_layer_activations.detach()
 
 
+def calculate_ig_attributions(img, baseline=None, steps=50):
+    # Initialize baseline if not provided
+    if baseline is None:
+        baseline = torch.zeros_like(img)  # Using zero as baseline
+
+    # Ensure baseline and input are on same device
+    img = img.to(baseline.device)
+
+    # Initialize attributions tensor to accumulate gradients across steps
+    attributions = torch.zeros(2048, dtype=img.dtype, device=img.device)
+
+    # Compute Integrated Gradients by averaging over multiple steps
+    for step in range(steps):
+        # Compute interpolation coefficient (alpha)
+        alpha = (step + 1) / steps
+
+        # Create interpolated input
+        interpolated_input = baseline * (1 - alpha) + img * alpha
+        interpolated_input.requires_grad_()
+
+        # Forward pass through the model up to last layer activations
+        x = model.conv1(interpolated_input)
+        x = model.bn1(x)
+        x = model.relu(x)
+        x = model.maxpool(x)
+
+        x = model.layer1(x)
+        x = model.layer2(x)
+        x = model.layer3(x)
+        last_layer_activations_step = model.layer4(x)  # (1, 2048, 7, 7)
+
+        # Compute avgpool and FC manually
+        avgpool = torch.nn.AdaptiveAvgPool2d((1, 1))
+        pooled = avgpool(last_layer_activations_step)
+        flattened = pooled.view(pooled.size(0), -1)
+        logits = model.fc(flattened)  # (1, 1000)
+
+        # Select target logit
+        target_logit = logits[0, logits.argmax(dim=1)]
+
+        # Compute gradient of target logit with respect to last layer activations for this step
+        grads = torch.autograd.grad(target_logit, last_layer_activations_step)[0]
+
+        # Sum gradients across spatial dimensions and accumulate
+        channel_grads = grads.sum(dim=(2, 3)).abs().squeeze()
+        attributions += channel_grads
+
+    # Average the accumulated gradients over all steps to get final IG attributions
+    attributions /= steps
+
+    return attributions, last_layer_activations_step.detach()
+
+
 # --------------------------------------------------------------------------------------------------------------
 # Boris section begin
 # added visualization method
@@ -68,34 +121,6 @@ def visualize_activation_on_image(image_tensor, activation_map, title=""):
     plt.title(title)
     plt.axis("off")
     plt.show()
-
-# def visualize_saliency_map(image_tensor, attribution_map, title="Saliency Map"):
-#     img = image_tensor.squeeze(0).cpu()
-#     img_pil = F.to_pil_image(img)
-#
-#     saliency = attribution_map.squeeze().detach().cpu().abs()
-#     saliency -= saliency.min()
-#     saliency /= saliency.max()
-#
-#     plt.figure(figsize=(6, 6))
-#     plt.imshow(img_pil)
-#     plt.imshow(saliency, cmap='hot', alpha=0.5)
-#     plt.title(title)
-#     plt.axis("off")
-#     plt.show()
-
-
-# Saliency Map for inputxgradient for pixel attributions
-# def get_inputxgradient_saliency(img):
-#     img.requires_grad = True
-#     output = model(img)
-#     pred = output.argmax(dim=1)
-#     target = output[0, pred]
-#
-#     grad = torch.autograd.grad(target, img)[0]
-#     saliency = (grad * img).sum(dim=1, keepdim=True)
-#     return saliency
-
 
 
 # Adding InputXGradient
@@ -235,7 +260,7 @@ def jaccard(a, b):
 
 
 # compare multiple methods in one image to show where the different mehtods are "looking at"
-def compare_methods_on_image(img_tensor, model, methods=["vanilla", "inputxgrad", "smoothgrad", "gradcam"]):
+def compare_methods_on_image(img_tensor, model, methods=["vanilla", "inputxgrad", "smoothgrad", "gradcam", "ig"]):
     """
     Compare attribution maps from different methods on a single input image, to show their focus
     """
@@ -246,7 +271,8 @@ def compare_methods_on_image(img_tensor, model, methods=["vanilla", "inputxgrad"
         "vanilla": "Vanilla Gradient",
         "inputxgrad": "Input × Gradient",
         "smoothgrad": "SmoothGrad",
-        "gradcam": "Grad-CAM"
+        "gradcam": "Grad-CAM",
+        "ig": "Integrated Gradients"
     }
 
     for method in methods:
@@ -271,6 +297,12 @@ def compare_methods_on_image(img_tensor, model, methods=["vanilla", "inputxgrad"
         elif method == "gradcam":
             _, _, grad_cam_map = gradcam_channel_attributions(img_tensor)
             heatmap = grad_cam_map.squeeze()
+
+        elif method == "ig":
+            attributions, activations = calculate_ig_attributions(img_tensor)
+            top_channel = attributions.argmax().item()
+            heatmap = activations[0, top_channel].unsqueeze(0).unsqueeze(0)
+            heatmap = F_nn.interpolate(heatmap, size=(224, 224), mode="bilinear", align_corners=False).squeeze()
 
         else:
             continue
@@ -301,7 +333,7 @@ def compare_methods_on_image(img_tensor, model, methods=["vanilla", "inputxgrad"
     plt.show()
 
 
-selected_methods = ["vanilla", "inputxgrad", "smoothgrad", "gradcam"]
+selected_methods = ["ig", "vanilla", "inputxgrad", "smoothgrad", "gradcam"]
 # do the methods agree on polysemantic channels?
 per_class_poly = defaultdict(lambda: defaultdict(set))
 # Boris section end
@@ -383,6 +415,8 @@ for method_name in selected_methods:
             img_attributions, last_activations, smoothgrad_gradients = smoothgrad_channel_attributions(img)
         elif method_name == "gradcam":
             img_attributions, last_activations, grad_cam_map = gradcam_channel_attributions(img)
+        elif method_name == "ig":
+            img_attributions, last_activations = calculate_ig_attributions(img)
 
         total = img_attributions.sum()
         count = (img_attributions >= 0.02 * total).sum().item()
@@ -473,6 +507,8 @@ for method_name, best in best_img_per_method.items():
             attributions, activations, _ = smoothgrad_channel_attributions(img)
         elif method_name == "gradcam":
             attributions, activations, _ = gradcam_channel_attributions(img)
+        elif method_name == "ig":
+            attributions, activations = calculate_ig_attributions(img)
         else:
             continue
 
