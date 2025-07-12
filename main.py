@@ -50,10 +50,13 @@ def calculate_channel_attributions(img):
 def calculate_ig_attributions(img, baseline=None, steps=50):
     # Initialize baseline if not provided
     if baseline is None:
-        baseline = torch.zeros_like(img)  # Using zero as baseline
+        baseline = torch.randn_like(img)  # Using random noise as baseline
 
     # Ensure baseline and input are on same device
     img = img.to(baseline.device)
+
+    # Get predicted class for the original image
+    prediction = model(img).argmax(dim=1)
 
     # Initialize attributions tensor to accumulate gradients across steps
     attributions = torch.zeros(2048, dtype=img.dtype, device=img.device)
@@ -85,7 +88,7 @@ def calculate_ig_attributions(img, baseline=None, steps=50):
         logits = model.fc(flattened)  # (1, 1000)
 
         # Select target logit
-        target_logit = logits[0, logits.argmax(dim=1)]
+        target_logit = logits[0, prediction]
 
         # Compute gradient of target logit with respect to last layer activations for this step
         grads = torch.autograd.grad(target_logit, last_layer_activations_step)[0]
@@ -163,6 +166,9 @@ def smoothgrad_channel_attributions(img):
     noise_std = 0.15
     all_inputxgrads = []
 
+    # Get predicted class for the original image
+    prediction = model(img).argmax(dim=1)
+
     for _ in range(15):
         img_noisy = img + noise_std * torch.randn_like(img)
         img_noisy = img_noisy.detach().requires_grad_()
@@ -180,7 +186,7 @@ def smoothgrad_channel_attributions(img):
 
         pooled = torch.nn.functional.adaptive_avg_pool2d(activations, (1, 1))
         logits = model.fc(pooled.view(pooled.size(0), -1))
-        target_logit = logits[0, logits.argmax(dim=1)]
+        target_logit = logits[0, prediction]
 
         grads = torch.autograd.grad(target_logit, activations)[0]
         inputxgrad = grads * activations
